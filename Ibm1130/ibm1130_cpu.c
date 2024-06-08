@@ -162,6 +162,14 @@ static void cgi_start(void);
 static void cgi_stop(t_stat reason);
 static int simh_status_to_stopcode (int status);
 
+/* hook pointers from scp.c */
+void (*sim_vm_init) (void) = &sim_init; 
+extern char* (*sim_vm_read) (char *ptr, int32 size, FILE *stream);
+extern void (*sim_vm_post) (t_bool from_scp);
+extern CTAB *sim_vm_cmd;
+ 
+int trace_started = 0; 
+
 /* space to store extra simulator-specific commands */
 #define MAX_EXTRA_COMMANDS 10
 CTAB x_cmds[MAX_EXTRA_COMMANDS];
@@ -343,6 +351,7 @@ int32 ReadW  (int32 a)
 {
     SAR = a;
     SBR = (int32) M[(a) & mem_mask];
+if (trace_started && IAR >= 0x900 && cpu_unit.fileref) fprintf(cpu_unit.fileref, "RD %04x %04x" CRLF, a, SBR);
     return SBR;
 }
 
@@ -350,6 +359,7 @@ void WriteW (int32 a, int32 d)
 {
     SAR = a;
     SBR = d;
+if (trace_started && IAR >= 0x900 && cpu_unit.fileref) fprintf(cpu_unit.fileref, "WR %04x %04x %04x" CRLF, a, d, M[a & mem_mask]);
     M[a & mem_mask] = (int16) d;
 }
 
@@ -367,6 +377,7 @@ static uint16 ReadIndex (int32 tag)
         
     SAR = tag;                                  /* 1130: ordinary read from memory (like ReadW) */
     SBR = (int32) M[(tag) & mem_mask];
+if (trace_started && IAR >= 0x900 && cpu_unit.fileref) fprintf(cpu_unit.fileref, "RX %04x %04x" CRLF, tag, SBR);
     return SBR;
 }
 
@@ -381,6 +392,7 @@ static void WriteIndex (int32 tag, int32 d)
 
     SAR = tag;                                  /* 1130: ordinary write to memory (same as WriteW) */
     SBR = d;
+if (trace_started && IAR >= 0x900 && cpu_unit.fileref) fprintf(cpu_unit.fileref, "WX %04x %04x %04x" CRLF, tag, d, M[tag & mem_mask]);
     M[tag & mem_mask] = (int16) d;
 }
 
@@ -490,6 +502,23 @@ static int32 ibm1130_qcount ()
     }
     return cnt;
 }
+
+static char ftable[64] =
+ "01234567"
+ "89ABCDEF"
+ "GHIJKLMN"
+ "OPQRSTUV"
+ "WXYZ `#<"
+ "(+|&!$*)"
+ ";^-/,%_>"
+ "?:.@'=\"x";
+
+static char xlat (int32 ACC)
+  {
+    if (ACC < 0 || ACC > 63)
+      return '?';
+    return ftable[ACC];
+  }
 
 t_stat sim_instr (void)
 {
@@ -682,7 +711,7 @@ t_stat sim_instr (void)
                 iocc_func = (iocc_op  >>  8) & 0x0007;
                 iocc_mod  =  iocc_op         & 0x00FF;
 
-                if ((cpu_unit.flags & (UNIT_ATT|UNIT_TRACE_IO)) == (UNIT_ATT|UNIT_TRACE_IO))
+                if (trace_started && (cpu_unit.flags & (UNIT_ATT|UNIT_TRACE_IO)) == (UNIT_ATT|UNIT_TRACE_IO))
                     trace_io("* XIO %s %s mod %02x addr %04x", xio_funcs[iocc_func], (iocc_func == XIO_SENSE_IRQ) ? "-" : xio_devs[iocc_dev], iocc_mod, iocc_addr);
 
                 ACC = 0;                            /* ACC is destroyed, and default XIO_SENSE_DEV result is 0 */
@@ -1763,8 +1792,554 @@ static t_stat cpu_attach (UNIT *uptr, CONST char *cptr)
     return attach_unit(uptr, quotefix(cptr, gbuf));         /* fix quotes in filenames & attach */
 }
 
+static void forth_trace (FILE * fp)
+  {
+    //static int started = 0;
+    //if (IAR == 0x09fa && (M[0x09fa] & 0xffff) == 0x6BFE)
+      //started = 1;
+
+    //if (started)
+      {
+        switch (IAR)
+          {
+            case 0x091b: // at return from disk accept, the converted char is in acc
+              fprintf (fp, "accept '%c' %02x\n", xlat (ACC), ACC & 0xfff);
+              break;
+
+            case 0x09A1: 
+              {
+                int32 addr = M[3] & 0xffff;
+                fprintf (fp, "DO found %04x %c%c%c%c\n", addr, xlat ((M[addr]>> 8) & 0xff), xlat (M[addr] & 0xff), xlat ((M[addr+1]>> 8) & 0xff), xlat (M[addr+1] & 0xff));
+              }
+              break;
+
+            case 0x0913:
+              fprintf (fp, "ACCEP\n");
+              break;
+
+            case 0x091D:
+              fprintf (fp, "RETRV\n");
+              break;
+
+            case 0x09A4:
+              {
+                int32 i = 0x0AE2;  // WORD
+                int32 d0 = (M[i]>> 8) & 0xff;
+                int32 d1 = M[i] & 0xff;
+                int32 d2 = (M[i+1]>> 8) & 0xff;
+                int32 d3 = M[i+1] & 0xff;
+                int isnothex =  ((d0 > 15 && d0 != 0x24) ||
+                    (d1 > 15 && d1 != 0x24) ||
+                    (d2 > 15 && d2 != 0x24) ||
+                    (d3 > 15 && d3 != 0x24));
+                fprintf (fp, "UNDEF %c '%c%c%c%c'\n", isnothex ? '?' : 'x', xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff));
+#if 0
+                int32 E = M[0x0AD8] & 0xffff; // end of dictionary
+                int32 D = 0x0D50;
+                fprintf (fp, "D %04x E %04x\n", D, E);
+                for (int32 i = D; i < E; i += 4)
+                  {
+                    fprintf (fp, "%c%c%c%c %04x %04x\n", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff), M[i+2] & 0xffff, M[i+3] & 0xffff);
+                  }
+                int32 IC = M[0x0d83] & 0xffff;
+                fprintf (fp, "IC %04x\n", IC);
+                int col = 0;
+                for (int32 i = 0x19ff; i <= IC; i ++)
+                  {
+                    if (col % 8 == 0)
+                      fprintf (fp, "%04x:", i);
+                    fprintf (fp, " %c%c", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff));
+                    col ++;
+                    if (col % 8 == 0)
+                      fprintf (fp, "\n");
+                  }
+                if (col % 8 != 0)
+                  fprintf (fp, "\n");
+#endif
+              }
+              break;
+
+#define STK0 (0x0AF6 - 1)
+            case 0x0a32:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "FORTH pops data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x9ac:
+              {
+                int32 i = 0x0AE2;  // WORD
+                //int32 d0 = xlat ((M[i]>> 8) & 0xff);
+                //int32 d1 = xlat (M[i] & 0xff);
+                //int32 d2 = xlat ((M[i+1]>> 8) & 0xff);
+                //int32 d3 = xlat (M[i+1] & 0xff);
+                int32 d0 = (M[i]>> 8) & 0xff;
+                int32 d1 = M[i] & 0xff;
+                int32 d2 = (M[i+1]>> 8) & 0xff;
+                int32 d3 = M[i+1] & 0xff;
+                if ((d0 > 15 && d0 != 0x24) ||
+                    (d1 > 15 && d1 != 0x24) ||
+                    (d2 > 15 && d2 != 0x24) ||
+                    (d3 > 15 && d3 != 0x24))
+                fprintf (fp, "HEX error '%c%c%c%c'\n", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff));
+              }
+              break;
+
+            case 0x09b2:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "HEX pushes data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0a42:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "RECUR pops data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0a8a:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "LOC pushes data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0a99:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "STORE pops * 2 data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0a90:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "OR pops data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0aa2:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "SD pops data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0aa7:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "ADDR pushes data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0ab3:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "LITER pushes data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0abf:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "OPER pushes data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x0acd:
+              {
+                 int32 sp = M[2] & 0xffff;
+                 fprintf (fp, "CONS pops data stack to %04x %d\n", sp, sp - STK0);
+              }
+              break;
+
+            case 0x09D3:
+              fprintf (fp, "ENTER\n");
+              break;
+
+            case 0x09CD:
+              fprintf (fp, "ENTRY1 '%c%c'\n", xlat ((ACC >> 8) & 0xff), xlat (ACC & 0xff));;
+              break;
+
+            case 0x09CF:
+              fprintf (fp, "ENTRY2 '%c%c'\n", xlat ((ACC >> 8) & 0xff), xlat (ACC & 0xff));;
+              break;
+
+            case 0x0980: // DEPOS
+              {
+                int32_t word = ACC / 2;
+                int32_t nib = ACC & 1;
+                if (word >= 0x0DC3 && word < 0x19ff) // in dictionary
+                  {
+                    fprintf (fp, "%02x %04x.%x ! dict %d\n", M[0x0ADF] & 0xffff, word, nib, word - 0x19ff);
+                  }
+                else if (word >= 0x19ff) // in defintions
+                  {
+                    fprintf (fp, "%02x %04x.%x ! defs %d\n", M[0x0ADF] & 0xffff, word, nib, word - 0x19ff);
+                  }
+                else
+                  {
+                    //fprintf (fp, "%02x %04x.%x !\n", M[0x0ADF] & 0xffff, word, nib);
+                  }
+              }
+              break;
+
+            case 0x0A71: // COM
+              fprintf (fp, "COMMA\n");
+              break;
+
+#if 0
+            case 0x0A2D: // LINK BALO
+            case 0x0A2E: // LINK BALO
+              {
+                int32 E = M[0x0AD8] & 0xffff; // end of dictionary
+                int32 D = 0x0D50;
+                fprintf (fp, "D %04x E %04x\n", D, E);
+                for (int32 i = D; i < E; i += 4)
+                  {
+                    fprintf (fp, "%c%c%c%c %04x %04x\n", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff), M[i+2] & 0xffff, M[i+3] & 0xffff);
+                  }
+              }
+             break;
+
+#endif
+#if 0
+            case 0x0998:
+              {
+                int32 i = M[3] & 0xffff;
+                fprintf (fp, "DO comparing at %04x '%c%c%c%c'\n", i, xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff));
+              }
+              break;
+#endif
+
+            case 0x0994:
+              {
+                int32 i = 0x0AE2; 
+                fprintf (fp, "DO searching for '%c%c%c%c'\n", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff));
+              }
+              break;
+
+            default:
+              break;
+          }
+      }
+  }
+
+#include <stdint.h>
+//#include "../FORTH/syms.h"
+// generated by extr_syms
+struct fsyms_s
+  {
+    uint16_t offset;
+    char * sym;
+  };
+struct fsyms_s fsyms[] =
+  {
+    0x0900, "CONVE",
+    0x0904, "CV1  ",
+    0x090B, "CV2  ",
+    0x0912, "ACCEP",
+    0x091D, "RETRV",
+    0x0922, "NEXT ",
+    0x0927, "NE1  ",
+    0x0931, "NE2  ",
+    0x093A, "ALPHA",
+    0x094D, "AL1  ",
+    0x0954, "SPEC1",
+    0x095D, "SC   ",
+    0x095E, "TWO  ",
+    0x095F, "THREE",
+    0x0960, "BL2  ",
+    0x0961, "BL   ",
+    0x0962, "SAVE ",
+    0x0969, "SAVE0",
+    0x096C, "ONE  ",
+    0x096D, "TEMP ",
+    0x096E, "FETCH",
+    0x0978, "FE1  ",
+    0x097B, "FE2  ",
+    0x097E, "FF   ",
+    0x097F, "DEPOS",
+    0x098A, "DE1  ",
+    0x098E, "DE2  ",
+    0x0992, "FF00 ",
+    0x0993, "DO   ",
+    0x0996, "DO1  ",
+    0x09A3, "UNDEF",
+    0x09AA, "F000 ",
+    0x09AB, "HEX  ",
+    0x09B5, "HE1  ",
+    0x09C1, "ENTRY",
+    0x09D2, "ENTER",
+    0x09E0, "EN1  ",
+    0x09E7, "EN3  ",
+    0x09EF, "EN2  ",
+    0x09F5, "ASAVE",
+    0x09F6, "ASAV0",
+    0x09F7, "DOT  ",
+    0x09F8, "COMMA",
+    0x09F9, "X3   ",
+    0x09FB, "START",
+    0x0A31, "FORTH",
+    0x0A34, "FO1  ",
+    0x0A3B, "RECUR",
+    0x0A44, "RETUR",
+    0x0A4B, "INC  ",
+    0x0A55, "INTER",
+    0x0A6F, "ARETR",
+    0x0A70, "COM  ",
+    0x0A83, "LOC  ",
+    0x0A8D, "OR   ",
+    0x0A94, "STORE",
+    0x0A9B, "SD   ",
+    0x0AA4, "ADDR ",
+    0x0AB0, "LITER",
+    0x0AB7, "OPER ",
+    0x0AC3, "CONS ",
+    0x0ACF, "INTEG",
+    0x0AD7, "E1   ",
+    0x0AD8, "E    ",
+    0x0AD9, "W1   ",
+    0x0ADF, "A    ",
+    0x0AE0, "N    ",
+    0x0AE2, "WORD ",
+    0x0AF6, "STACK",
+    0x0B06, "R    ",
+    0x0B07, "INTST",
+    0x0B27, "C1   ",
+    0x0B28, "C2   ",
+    0x0B29, "C3   ",
+    0x0B2A, "ERROR",
+    0x0B2D, "RECOR",
+    0x0B3A, "D152 ",
+    0x0B3B, "BLOCK",
+    0x0B42, "BL1  ",
+    0x0B4F, "FIXUP",
+    0x0B59, "FI1  ",
+    0x0B6D, "FX1  ",
+    0x0B6E, "FX2  ",
+    0x0B6F, "PUT  ",
+    0x0B85, "PRINT",
+    0x0B89, "PR2  ",
+    0x0B94, "PR3  ",
+    0x0B9A, "PR1  ",
+    0x0BA1, "AP   ",
+    0x0BA2, "DP0  ",
+    0x0BA3, "DP   ",
+    0x0BA4, "DP1  ",
+    0x0BA5, "PRN  ",
+    0x0BCA, "BCD  ",
+    0x0C09, "BCDBL",
+    0x0C0A, "BUF  ",
+    0x0C0B, "SECT ",
+    0x0D83, "IC   ",
+    0x0DC0, "E2   ",
+  };
+#define NFSYMS (sizeof (fsyms) / sizeof (struct fsyms_s))
+
+static char * lookup_fsym (int32 addr)
+  {
+    for (int i = 0; i < NFSYMS; i ++)
+      if (addr == fsyms[i].offset)
+        return fsyms[i].sym;
+    return NULL;
+  }
+
+static char *opcode[] = {
+	"?00 ",		"XIO ",		"SLA ",		"SRA ",
+	"LDS ",		"STS ",		"WAIT",		"?07 ",
+	"BSI ",		"BSC ",		"?0A ",		"?0B ",
+	"LDX ",		"STX ",		"MDX ",		"?0F ",
+	"A   ",		"AD  ",		"S   ",		"SD  ",
+	"M   ",		"D   ",		"?16 ",		"?17 ",
+	"LD  ",		"LDD ",		"STO ",		"STD ",
+	"AND ",		"OR  ",		"EOR ",		"?1F ",
+};
+void dump_core_fp (FILE * fp)
+  {
+    int32 E = M[0x0AD8] & 0xffff; // end of dictionary
+    int32 IC = M[0x0d83] & 0xffff;
+
+// Dump core from start (0x900 to end of dictionary; from heap start (0x1a00 to IC
+    for (int32 i = 0x900; i < E; i += 8)
+      {
+        fprintf (fp, "%04x:", i);
+        for (int32 j = 0; j < 8; j ++)
+          fprintf (fp, " %04x", M[i + j] & 0xffff);
+        fprintf (fp, "    '");
+        for (int32 j = 0; j < 8; j ++)
+          fprintf (fp, "%c%c", xlat ((M[i + j] >> 8) & 0xff), xlat (M[i + j] & 0xff));
+        fprintf (fp, "'\r\n");
+      }
+    fprintf (fp, "\r\n");
+
+    for (int32 i = 0x1a00; i < IC; i += 8)
+      {
+        fprintf (fp, "%04x:", i);
+        for (int32 j = 0; j < 8; j ++)
+          fprintf (fp, " %04x", M[i + j] & 0xffff);
+        fprintf (fp, "    '");
+        for (int32 j = 0; j < 8; j ++)
+          fprintf (fp, "%c%c", xlat ((M[i + j] >> 8) & 0xff), xlat (M[i + j] & 0xff));
+        fprintf (fp, "'\r\n");
+      }
+    fprintf (fp, "\r\n");
+
+    int32 D = 0x0D50;
+    fprintf (fp, "D %04x E %04x\r\n", D, E);
+    for (int32 i = D; i < E; i += 4)
+      {
+        // If the code pointer is past 0DC4, then the code is a operator, and exectuable code is at codeptr
+        // The end of the executable code is harder to determine. 
+        // If the code pointer is INTER (0A56), then the data pointer points to a defintion. 
+        // The end of the definition is a comma
+        int32 codeptr = M[i + 2] & 0xffff;
+        int32 dataptr = M[i + 3] & 0xffff;
+        char * fsym = lookup_fsym (codeptr);
+        if (! fsym)
+          {
+            switch (codeptr)
+              {
+                case 0x0A56: fsym = "INTER"; break;
+                case 0x0AA5: fsym = "ADDR "; break;
+                case 0x0AB1: fsym = "LITER"; break;
+                default:
+                  if (codeptr > 0x0dc4)
+                             fsym = "oper "; 
+                  else
+                             fsym = "     "; break;
+              }
+          }
+        fprintf (fp,
+                 "%c%c%c%c %04x %04x %04x.%x %s\r\n",
+                 xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff),
+                 codeptr,
+                 dataptr,
+                 dataptr / 2,
+                 dataptr & 1,
+                 fsym);
+        if (codeptr == 0x0A56) // INTER
+          {
+            fprintf (fp,  "    .%c%c%c%c ", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff), xlat ((M[i+1]>> 8) & 0xff), xlat (M[i+1] & 0xff));
+            for (int32 j = dataptr; j < dataptr + 80; j ++)
+              {
+                int32 addr = j / 2;
+                int32 word = M[addr] & 0xffff;
+                char ch;
+                if (j & 1)
+                  ch = xlat (word & 0xff);
+                else
+                  ch = xlat ((word >> 8) & 0xff);
+                fprintf (fp, "%c", ch);
+                if (ch == ',')
+                  break;
+              }
+            fprintf (fp,  "\r\n");
+          }
+        else if (codeptr > 0xDC4)
+          {
+            // The end of the code should be just before the start of the next definition/component
+            int32 end;
+            if (i + 4 < E) // not the last entry
+              {
+                int32 next_entry = i + 4;
+                int32 next_codeptr = M[next_entry + 2] & 0xffff;
+                if (next_codeptr == 0x0A56) // is INTERPRET?
+                  {
+                    end = (M[next_entry + 3] & 0xffff) / 2; // The dataptr in an INTERPRET is characater ptr
+                  }
+                else if (next_codeptr > 0x0dc4) // is COMPONENT?
+                  {
+                    end = next_codeptr;
+                  }
+                else // bail
+                  {
+                    end = -1;
+                  }
+              }
+            else // last entry
+              {
+                end = IC;
+              }
+            if (end != -1)
+              {
+                //fprintf (fp, "%04x:%04x\r\n", codeptr, end);
+                for (int j = codeptr; j < end; j ++)
+                  {
+                    int32 inst = M[j] & 0xffff;
+                    int32 op = (inst >> 11) & 0x1f;
+                    int32 f = (inst & 0x400) >> 10;
+                    int32 tag = (inst & 0x300) >> 8;
+                    int32 displ = inst & 0xff;
+                    static char * xr[4] = { " ", "1", "2", "3" };
+                    fprintf (fp, "  %04x %04x %s %s%s %04x\r\n", j, inst, opcode[op], f ? "L" : " ", tag ? xr[tag] : "", displ);
+                  }
+              }
+          }
+      }
+#if 0
+    int32 IC = M[0x0d83] & 0xffff;
+    fprintf (fp, "IC %04x\r\n", IC);
+    int col = 0;
+    for (int32 i = 0x19ff; i <= IC; i ++)
+      {
+        if (col % 8 == 0)
+          fprintf (fp, "%04x:", i);
+        fprintf (fp, " %c%c", xlat ((M[i]>> 8) & 0xff), xlat (M[i] & 0xff));
+        col ++;
+        if (col % 8 == 0)
+          fprintf (fp, "\r\n");
+      }
+    if (col % 8 != 0)
+      fprintf (fp, "\r\n");
+#endif
+  }
+
+void dump_core (void)
+  {
+    dump_core_fp (stdout);
+    if (cpu_unit.fileref) 
+      dump_core_fp (cpu_unit.fileref);
+  }
+
+void dump_stack (void)
+  {
+    // M[2] is the stack pointer. 0AF6 is the stack base.
+    const int base = 0x0af6;
+    int32 sp = M[2] & 0xffff;
+    printf ("\r\n");
+    if (sp < base - 1)
+      {
+        printf ("stack underflow %d.\r\n", base - sp);
+        return;
+      }
+    if (sp > base + 16)
+      {
+        printf ("stack underflow %d.\r\n", base - sp);
+        sp = base + 16;
+      }
+    printf ("Stack:");
+    for (int32 p = base; p <= sp; p ++)
+      {
+        printf (" %04x", M[p] & 0xffff);
+      }
+    printf ("\r\n");
+  }
+
 static void trace_instruction (void)
 {
+#if 1
+    if (IAR == 0x0026 && (M[0x0026] & 0xffff) == 0x4c00)
+      { trace_started = 1; return; }
+    if (! trace_started) return;
+#endif
+    if (IAR < 0x900) return;
+//forth_trace (stdout);
+if (cpu_unit.fileref) forth_trace (cpu_unit.fileref);
+
     t_value v[2];
     float fac;
     short exp;
@@ -1864,6 +2439,7 @@ static void trace_common (FILE *fout)
 
 void trace_io (const char *fmt, ...)
 {
+if (! trace_started) return;
     va_list args;
 
     if ((cpu_unit.flags & UNIT_ATT) == 0)
